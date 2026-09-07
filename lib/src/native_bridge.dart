@@ -1,0 +1,34 @@
+import 'package:flutter/services.dart';
+
+class NativeBridge {
+  static const _channel = MethodChannel(
+    'io.github.0x0bb9.lan_apk_sync/native',
+  );
+
+  Future<String?> pickApk() => _channel.invokeMethod<String>('pickApk');
+
+  Future<String?> pickDirectory() =>
+      _channel.invokeMethod<String>('pickDirectory');
+
+  Future<String> sha256(String path) async {
+    final value = await _channel.invokeMethod<String>(
+      'sha256',
+      {'path': path},
+    );
+    if (value == null || value.length != 64) {
+      throw StateError('无法计算 APK 的 SHA-256。');
+    }
+    return value;
+  }
+
+  Future<Uint8List> qrCode(String value) async {
+    final bytes = await _channel.invokeMethod<Uint8List>(
+      'qrCode',
+      {'value': value},
+    );
+    if (bytes == null || bytes.isEmpty) {
+      throw StateError('无法生成二维码。');
+    }
+    return bytes;
+  }
+}
