@@ -4,13 +4,16 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
-import 'apk_locator.dart';
+import 'apk_monitor.dart';
 import 'apk_share_server.dart';
 import 'native_bridge.dart';
+import 'share_settings.dart';
 import 'shared_apk.dart';
 
 class HomePage extends StatefulWidget {
-  const HomePage({super.key});
+  const HomePage({super.key, this.loadNetworkInterfaces});
+
+  final Future<List<NetworkInterface>> Function()? loadNetworkInterfaces;
 
   @override
   State<HomePage> createState() => _HomePageState();
@@ -19,19 +22,28 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   final _native = NativeBridge();
   final _portController = TextEditingController(text: '8787');
+  late final _monitor = ApkMonitor(sha256: _native.sha256);
 
   ApkShareServer? _server;
-  SharedApk? _apk;
-  String? _selectedFilePath;
-  String? _watchedDirectory;
+  ShareSettings? _settings;
   Timer? _monitorTimer;
+  Timer? _networkTimer;
+  bool _initializing = true;
   bool _busy = false;
+  bool _refreshingApk = false;
+  bool _loadingAddresses = false;
+  bool _resumePending = false;
   String? _error;
+  String? _apkError;
   List<_LanAddress> _addresses = const [];
   _LanAddress? _selectedAddress;
   Uint8List? _qrCode;
   final List<DownloadEvent> _downloads = [];
 
+  SharedApk? get _apk => _monitor.apk;
+  String? get _watchedDirectory =>
+      _monitor.isDirectory ? _monitor.sourcePath : null;
+  bool get _canInteract => !_initializing && !_busy && _settings != null;
   bool get _isRunning => _server?.isRunning ?? false;
   String? get _shareUrl {
     final server = _server;
@@ -43,33 +55,70 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
-    unawaited(_loadAddresses());
+    unawaited(_initialize());
   }
 
   @override
   void dispose() {
     _monitorTimer?.cancel();
+    _networkTimer?.cancel();
     unawaited(_server?.stop());
     _portController.dispose();
     super.dispose();
   }
 
-  Future<void> _pickApk() async {
-    final path = await _native.pickApk();
-    if (path == null) return;
-    _watchedDirectory = null;
-    _selectedFilePath = path;
-    await _refreshApk(force: true);
-    _startMonitoring();
+  Future<void> _initialize() async {
+    setState(() {
+      _initializing = true;
+      _error = null;
+    });
+    try {
+      final values = await _native.loadSettings();
+      final settings = ShareSettings.fromMap(values);
+      // Save the token before publishing any URL, including the first launch.
+      await _native.saveSettings(settings);
+      if (!mounted) return;
+      setState(() {
+        _settings = settings;
+        _portController.text = '${settings.port}';
+        final path = values['sourcePath'];
+        if (path is String) {
+          _monitor.select(path, directory: values['sourceKind'] == 'directory');
+        }
+        _error = values['sourceError'] as String?;
+      });
+      await _loadAddresses();
+      await _refreshApk();
+      if (!mounted) return;
+      _startMonitoring();
+      _resumePending = settings.autoStart && _monitor.hasSource;
+    } on Object catch (error) {
+      if (mounted) setState(() => _error = '无法恢复设置：${_errorMessage(error)}');
+    } finally {
+      if (mounted) setState(() => _initializing = false);
+    }
+    if (mounted && _resumePending) await _startServer();
   }
 
-  Future<void> _pickDirectory() async {
-    final path = await _native.pickDirectory();
-    if (path == null) return;
-    _selectedFilePath = null;
-    _watchedDirectory = path;
-    await _refreshApk(force: true);
-    _startMonitoring();
+  Future<void> _pickSource({required bool directory}) async {
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final path =
+          directory ? await _native.pickDirectory() : await _native.pickApk();
+      if (path == null || !mounted) return;
+      setState(() {
+        _monitor.select(path, directory: directory);
+        _apkError = null;
+      });
+      await _refreshApk();
+    } on Object catch (error) {
+      if (mounted) setState(() => _error = _errorMessage(error));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
   }
 
   void _startMonitoring() {
@@ -78,64 +127,38 @@ class _HomePageState extends State<HomePage> {
       const Duration(seconds: 2),
       (_) => unawaited(_refreshApk()),
     );
+    _networkTimer?.cancel();
+    _networkTimer = Timer.periodic(const Duration(seconds: 10), (_) async {
+      await _loadAddresses();
+      if (mounted && _resumePending && _canInteract) await _startServer();
+    });
   }
 
-  Future<void> _refreshApk({bool force = false}) async {
-    if (_busy) return;
-    _busy = true;
-    if (mounted) setState(() => _error = null);
+  Future<void> _refreshApk() async {
+    if (_refreshingApk || !_monitor.hasSource) return;
+    _refreshingApk = true;
     try {
-      final path = _selectedFilePath;
-      final directory = _watchedDirectory;
-      final file = directory != null
-          ? await findNewestApk(directory)
-          : path == null
-              ? null
-              : File(path);
-      if (file == null || !await file.exists()) {
-        if (force) throw StateError('所选目录中没有找到 APK。');
-        return;
-      }
-
-      final before = await file.stat();
-      final current = _apk;
-      final unchanged = current != null &&
-          current.file.path == file.path &&
-          current.size == before.size &&
-          current.modifiedAt == before.modified;
-      if (!force && unchanged) return;
-
-      final sha256 = await _native.sha256(file.path);
-      final after = await file.stat();
-      if (before.size != after.size || before.modified != after.modified) {
-        return;
-      }
-
-      if (!mounted) return;
-      setState(() {
-        _apk = SharedApk(
-          file: file,
-          size: after.size,
-          modifiedAt: after.modified,
-          sha256: sha256,
-        );
-      });
+      await _monitor.refresh();
+      if (mounted) setState(() => _apkError = null);
     } on Object catch (error) {
       if (mounted) {
-        setState(() => _error = '$error'.replaceFirst('Bad state: ', ''));
+        setState(() => _apkError = '读取 APK 失败：${_errorMessage(error)}');
       }
     } finally {
-      _busy = false;
+      _refreshingApk = false;
     }
   }
 
   Future<void> _loadAddresses() async {
+    if (_loadingAddresses) return;
+    _loadingAddresses = true;
     try {
-      final interfaces = await NetworkInterface.list(
-        type: InternetAddressType.IPv4,
-        includeLoopback: false,
-        includeLinkLocal: false,
-      );
+      final interfaces = await (widget.loadNetworkInterfaces?.call() ??
+          NetworkInterface.list(
+            type: InternetAddressType.IPv4,
+            includeLoopback: false,
+            includeLinkLocal: false,
+          ));
       final addresses = <_LanAddress>[
         for (final interface in interfaces)
           for (final address in interface.addresses)
@@ -152,17 +175,24 @@ class _HomePageState extends State<HomePage> {
       setState(() {
         _addresses = addresses;
         if (_selectedAddress == null || !addresses.contains(_selectedAddress)) {
-          _selectedAddress = addresses.firstOrNull;
+          _selectedAddress = addresses
+                  .where(
+                      (value) => value.address == _settings?.preferredAddress)
+                  .firstOrNull ??
+              addresses.firstOrNull;
         }
       });
       await _refreshQrCode();
     } on Object catch (error) {
       if (mounted) setState(() => _error = '无法读取局域网地址：$error');
+    } finally {
+      _loadingAddresses = false;
     }
   }
 
   Future<void> _startServer() async {
-    if (_apk == null) {
+    if (_isRunning || _busy || _settings == null) return;
+    if (!_monitor.hasSource) {
       setState(() => _error = '请先选择 APK 或构建输出目录。');
       return;
     }
@@ -179,10 +209,19 @@ class _HomePageState extends State<HomePage> {
     try {
       await _loadAddresses();
       if (_addresses.isEmpty) {
-        throw StateError('没有发现可用于同一 Wi‑Fi 的局域网 IPv4 地址。');
+        throw StateError('未连接局域网，请连接 Wi-Fi 后重试。自动恢复时会等待网络连接。');
       }
+      final settings = _settings!.copyWith(
+        port: port,
+        preferredAddress:
+            _settings!.preferredAddress ?? _selectedAddress?.address,
+      );
+      await _native.saveSettings(settings);
+      if (!mounted) return;
+      setState(() => _settings = settings);
       final server = ApkShareServer(
         currentApk: () => _apk,
+        token: settings.token,
         onDownload: (event) {
           if (!mounted) return;
           setState(() {
@@ -196,15 +235,19 @@ class _HomePageState extends State<HomePage> {
         await server.stop();
         return;
       }
-      setState(() => _server = server);
+      setState(() {
+        _server = server;
+        _resumePending = false;
+      });
       await _refreshQrCode();
     } on SocketException catch (error) {
+      _resumePending = false;
       if (mounted) {
         setState(() => _error = '无法启动端口 $port：${error.message}');
       }
     } on Object catch (error) {
       if (mounted) {
-        setState(() => _error = '$error'.replaceFirst('Bad state: ', ''));
+        setState(() => _error = _errorMessage(error));
       }
     } finally {
       if (mounted) setState(() => _busy = false);
@@ -216,8 +259,82 @@ class _HomePageState extends State<HomePage> {
     setState(() {
       _server = null;
       _qrCode = null;
+      _resumePending = false;
     });
     await server?.stop();
+  }
+
+  Future<void> _setAutoStart(bool value) async {
+    setState(() => _busy = true);
+    try {
+      final settings = _settings!.copyWith(autoStart: value);
+      await _native.saveSettings(settings);
+      if (mounted) {
+        setState(() {
+          _settings = settings;
+          if (!value) _resumePending = false;
+        });
+      }
+    } on Object catch (error) {
+      if (mounted) setState(() => _error = _errorMessage(error));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _selectAddress(_LanAddress? value) async {
+    if (value == null) return;
+    setState(() => _busy = true);
+    try {
+      final settings = _settings!.copyWith(preferredAddress: value.address);
+      await _native.saveSettings(settings);
+      if (!mounted) return;
+      setState(() {
+        _settings = settings;
+        _selectedAddress = value;
+      });
+      await _refreshQrCode();
+    } on Object catch (error) {
+      if (mounted) setState(() => _error = _errorMessage(error));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _resetShareLink() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('重置分享链接？'),
+        content: const Text('旧链接、手机收藏和桌面快捷方式将失效。重置后需要把新地址保存到手机。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('确认重置'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    setState(() => _busy = true);
+    try {
+      final settings = _settings!.copyWith(token: newShareToken());
+      await _native.saveSettings(settings);
+      if (!mounted) return;
+      setState(() {
+        _settings = settings;
+        _server?.replaceToken(settings.token);
+      });
+      await _refreshQrCode();
+    } on Object catch (error) {
+      if (mounted) setState(() => _error = _errorMessage(error));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
   }
 
   Future<void> _refreshQrCode() async {
@@ -265,9 +382,18 @@ class _HomePageState extends State<HomePage> {
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 const _Hero(),
-                if (_error != null) ...[
+                if (_initializing) ...[
                   const SizedBox(height: 16),
-                  _ErrorBanner(message: _error!),
+                  const LinearProgressIndicator(),
+                ],
+                if (_error != null || _apkError != null) ...[
+                  const SizedBox(height: 16),
+                  _ErrorBanner(message: _error ?? _apkError!),
+                  if (_settings == null)
+                    TextButton(
+                      onPressed: _initializing ? null : _initialize,
+                      child: const Text('重新加载设置'),
+                    ),
                 ],
                 const SizedBox(height: 18),
                 LayoutBuilder(
@@ -310,7 +436,7 @@ class _HomePageState extends State<HomePage> {
     final apk = _apk;
     return _Panel(
       title: '1. 选择构建产物',
-      subtitle: '可选择单个 APK，或监听构建输出目录中的最新 APK。',
+      subtitle: '首次选择输出目录，后续正常打包即可；目录会自动记住。',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -319,12 +445,14 @@ class _HomePageState extends State<HomePage> {
             runSpacing: 10,
             children: [
               FilledButton.icon(
-                onPressed: _busy ? null : _pickApk,
+                onPressed:
+                    _canInteract ? () => _pickSource(directory: false) : null,
                 icon: const Icon(Icons.android),
                 label: const Text('选择 APK'),
               ),
               OutlinedButton.icon(
-                onPressed: _busy ? null : _pickDirectory,
+                onPressed:
+                    _canInteract ? () => _pickSource(directory: true) : null,
                 icon: const Icon(Icons.folder_open),
                 label: const Text('监听输出目录'),
               ),
@@ -339,8 +467,12 @@ class _HomePageState extends State<HomePage> {
               border: Border.all(color: const Color(0xFFE2E8F0)),
             ),
             child: apk == null
-                ? const Text('尚未选择 APK',
-                    style: TextStyle(color: Color(0xFF64748B)))
+                ? Text(
+                    _monitor.hasSource
+                        ? '等待 APK 生成或写入完成…\n可先开始同步，手机页面会自动更新。'
+                        : '尚未选择 APK 或输出目录',
+                    style: const TextStyle(color: Color(0xFF64748B)),
+                  )
                 : Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
@@ -374,6 +506,12 @@ class _HomePageState extends State<HomePage> {
               '正在监听：$_watchedDirectory',
               style: const TextStyle(fontSize: 12, color: Color(0xFF64748B)),
             ),
+          ] else if (_monitor.sourcePath != null) ...[
+            const SizedBox(height: 10),
+            Text(
+              '已记住文件：${_monitor.sourcePath}',
+              style: const TextStyle(fontSize: 12, color: Color(0xFF64748B)),
+            ),
           ],
           const SizedBox(height: 22),
           const Divider(),
@@ -387,7 +525,7 @@ class _HomePageState extends State<HomePage> {
                 width: 140,
                 child: TextField(
                   controller: _portController,
-                  enabled: !_isRunning,
+                  enabled: !_isRunning && _canInteract,
                   keyboardType: TextInputType.number,
                   inputFormatters: [FilteringTextInputFormatter.digitsOnly],
                   decoration: const InputDecoration(labelText: '端口'),
@@ -397,17 +535,25 @@ class _HomePageState extends State<HomePage> {
               Expanded(
                 child: _isRunning
                     ? OutlinedButton.icon(
-                        onPressed: _stopServer,
+                        onPressed: _canInteract ? _stopServer : null,
                         icon: const Icon(Icons.stop_circle_outlined),
                         label: const Text('停止同步'),
                       )
                     : FilledButton.icon(
-                        onPressed: _busy ? null : _startServer,
+                        onPressed: _canInteract ? _startServer : null,
                         icon: const Icon(Icons.wifi_tethering),
                         label: const Text('开始同步'),
                       ),
               ),
             ],
+          ),
+          const SizedBox(height: 12),
+          SwitchListTile.adaptive(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('下次打开自动开始同步'),
+            subtitle: const Text('恢复上次的目录、端口和分享链接；无需重新选择。'),
+            value: _settings?.autoStart ?? true,
+            onChanged: _canInteract ? _setAutoStart : null,
           ),
         ],
       ),
@@ -417,8 +563,8 @@ class _HomePageState extends State<HomePage> {
   Widget _buildReceiverPanel() {
     final url = _shareUrl;
     return _Panel(
-      title: '3. 手机扫码下载',
-      subtitle: 'Mac 和 Android 手机需要连接同一个 Wi‑Fi。',
+      title: '3. 手机固定入口',
+      subtitle: '首次打开后收藏或添加到桌面，以后直接打开下载最新 APK。',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -434,54 +580,75 @@ class _HomePageState extends State<HomePage> {
                         Text('${address.address}  (${address.interfaceName})'),
                   ),
               ],
-              onChanged: _isRunning
-                  ? (value) {
-                      setState(() => _selectedAddress = value);
-                      unawaited(_refreshQrCode());
-                    }
-                  : null,
+              onChanged: _canInteract ? _selectAddress : null,
             )
           else
             const Text('未发现局域网 IPv4 地址。'),
-          const SizedBox(height: 18),
+          const SizedBox(height: 14),
           Container(
-            height: 252,
-            alignment: Alignment.center,
+            padding: const EdgeInsets.all(14),
             decoration: BoxDecoration(
-              color: Colors.white,
-              borderRadius: BorderRadius.circular(18),
+              color: const Color(0xFFF8FAFC),
+              borderRadius: BorderRadius.circular(14),
               border: Border.all(color: const Color(0xFFE2E8F0)),
             ),
-            child: _qrCode == null
-                ? Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        _isRunning ? Icons.qr_code_2 : Icons.wifi_off,
-                        size: 64,
-                        color: const Color(0xFF94A3B8),
-                      ),
-                      const SizedBox(height: 10),
-                      Text(_isRunning ? '正在生成二维码…' : '启动服务后显示二维码'),
-                    ],
-                  )
-                : Padding(
-                    padding: const EdgeInsets.all(16),
-                    child: Image.memory(_qrCode!,
-                        filterQuality: FilterQuality.none),
-                  ),
-          ),
-          const SizedBox(height: 14),
-          SelectableText(
-            url ?? '服务尚未启动',
-            textAlign: TextAlign.center,
-            style: const TextStyle(fontSize: 12, color: Color(0xFF475569)),
+            child: SelectableText(
+              url ?? '开始同步后显示可收藏的下载地址',
+              style: const TextStyle(fontSize: 13, color: Color(0xFF475569)),
+            ),
           ),
           const SizedBox(height: 10),
           OutlinedButton.icon(
             onPressed: url == null ? null : _copyUrl,
             icon: const Icon(Icons.copy),
-            label: const Text('复制下载地址'),
+            label: const Text('复制固定下载地址'),
+          ),
+          const SizedBox(height: 10),
+          const Text(
+            '请在路由器中为这台 Mac 保留固定 IP。IP、端口不变且未重置链接时，手机收藏在工具重启后仍然有效。',
+            style:
+                TextStyle(fontSize: 12, color: Color(0xFF475569), height: 1.5),
+          ),
+          if (_settings?.preferredAddress != null &&
+              _selectedAddress != null &&
+              _settings!.preferredAddress != _selectedAddress!.address) ...[
+            const SizedBox(height: 8),
+            Text(
+              'Mac 地址已从 ${_settings!.preferredAddress} 变为 ${_selectedAddress!.address}。旧收藏暂不可用，请恢复原 IP，或保存新地址。',
+              style: const TextStyle(color: Color(0xFFB45309), fontSize: 12),
+            ),
+          ],
+          Wrap(
+            spacing: 8,
+            children: [
+              TextButton.icon(
+                onPressed: _canInteract ? _loadAddresses : null,
+                icon: const Icon(Icons.refresh),
+                label: const Text('刷新网络地址'),
+              ),
+              TextButton.icon(
+                onPressed: _canInteract ? _resetShareLink : null,
+                icon: const Icon(Icons.link_off),
+                label: const Text('重置分享链接'),
+              ),
+            ],
+          ),
+          ExpansionTile(
+            tilePadding: EdgeInsets.zero,
+            title: const Text('首次连接：也可以扫码打开'),
+            children: [
+              SizedBox(
+                height: 220,
+                child: _qrCode == null
+                    ? Center(
+                        child: Text(_isRunning ? '正在生成二维码…' : '启动服务后显示二维码'))
+                    : Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: Image.memory(_qrCode!,
+                            filterQuality: FilterQuality.none),
+                      ),
+              ),
+            ],
           ),
           const SizedBox(height: 14),
           const Text(
@@ -660,3 +827,7 @@ String _formatTime(DateTime value) {
   return '${value.year}-${two(value.month)}-${two(value.day)} '
       '${two(value.hour)}:${two(value.minute)}:${two(value.second)}';
 }
+
+String _errorMessage(Object error) => error is PlatformException
+    ? error.message ?? '系统操作失败，请重试。'
+    : '$error'.replaceFirst('Bad state: ', '');

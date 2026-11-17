@@ -34,6 +34,17 @@ migrate_working_dir/
 /build/
 /dist/
 
+# Local packages, signing credentials and environment configuration
+*.apk
+*.aab
+*.jks
+*.keystore
+*.p12
+*.p8
+*.mobileprovision
+.env
+.env.*
+
 # Symbolication related
 app.*.symbols
 

@@ -1,5 +1,7 @@
 import 'package:flutter/services.dart';
 
+import 'share_settings.dart';
+
 class NativeBridge {
   static const _channel = MethodChannel(
     'io.github.0x0bb9.lan_apk_sync/native',
@@ -9,6 +11,12 @@ class NativeBridge {
 
   Future<String?> pickDirectory() =>
       _channel.invokeMethod<String>('pickDirectory');
+
+  Future<Map<Object?, Object?>> loadSettings() async =>
+      await _channel.invokeMapMethod<Object?, Object?>('loadSettings') ?? {};
+
+  Future<void> saveSettings(ShareSettings settings) =>
+      _channel.invokeMethod<void>('saveSettings', settings.toMap());
 
   Future<String> sha256(String path) async {
     final value = await _channel.invokeMethod<String>(

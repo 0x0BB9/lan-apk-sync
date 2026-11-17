@@ -1,8 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:math';
+import 'dart:math' show max, min;
 
+import 'share_settings.dart';
 import 'shared_apk.dart';
 
 class DownloadEvent {
@@ -21,14 +22,21 @@ class ApkShareServer {
   ApkShareServer({
     required SharedApk? Function() currentApk,
     void Function(DownloadEvent event)? onDownload,
+    String? token,
   })  : _currentApk = currentApk,
-        _onDownload = onDownload;
+        _onDownload = onDownload,
+        _token = token ?? newShareToken() {
+    if (!isValidShareToken(_token)) {
+      throw ArgumentError('Invalid share token.');
+    }
+  }
 
   final SharedApk? Function() _currentApk;
   final void Function(DownloadEvent event)? _onDownload;
-  final String token = _newToken();
+  String _token;
   HttpServer? _server;
 
+  String get token => _token;
   bool get isRunning => _server != null;
   int? get port => _server?.port;
 
@@ -47,6 +55,13 @@ class ApkShareServer {
 
   String urlFor(String address) => 'http://$address:${port ?? 8787}/$token/';
 
+  void replaceToken(String value) {
+    if (!isValidShareToken(value)) {
+      throw ArgumentError('Invalid share token.');
+    }
+    _token = value;
+  }
+
   Future<void> _listen(HttpServer server) async {
     try {
       await for (final request in server) {
@@ -61,6 +76,7 @@ class ApkShareServer {
     final response = request.response;
     response.headers
       ..set(HttpHeaders.cacheControlHeader, 'no-store')
+      ..set('Referrer-Policy', 'no-referrer')
       ..set('X-Content-Type-Options', 'nosniff');
 
     try {
@@ -72,7 +88,10 @@ class ApkShareServer {
 
       final base = '/$token';
       final path = request.uri.path;
-      if (path == base || path == '$base/') {
+      if (path == base) {
+        response.statusCode = HttpStatus.movedPermanently;
+        response.headers.set(HttpHeaders.locationHeader, '$base/');
+      } else if (path == '$base/') {
         await _writeText(
           response,
           _landingPage(),
@@ -233,7 +252,7 @@ class ApkShareServer {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>LAN APK Sync</title>
+  <title>测试包 · LAN APK Sync</title>
   <style>
     :root { color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     body { margin: 0; background: #eff6ff; color: #0f172a; }
@@ -264,18 +283,37 @@ class ApkShareServer {
     <div id="state">页面会自动检测 Mac 上的新构建。</div>
   </section>
   <section class="card">
+    <div class="name">把这个页面保存到手机</div>
+    <p class="meta">首次打开后，用浏览器菜单“收藏”或“添加到桌面”。以后直接打开此入口下载最新 APK，无需重复扫码，也不限定浏览器。</p>
+  </section>
+  <section class="card">
     <div class="name">安装步骤</div>
     <ol><li>点击下载 APK。</li><li>下载完成后打开文件。</li><li>按 Android 系统提示确认安装或更新。</li></ol>
   </section>
+  <noscript><section class="card">浏览器未启用 JavaScript。<a href="download">下载当前 APK</a></section></noscript>
 </main>
 <script>
 const base = location.pathname.endsWith('/') ? location.pathname : location.pathname + '/';
 let lastSha = '';
+function unavailable(message) {
+  const button = document.querySelector('#download');
+  button.removeAttribute('href');
+  button.classList.add('disabled');
+  button.textContent = '等待 APK';
+  document.querySelector('#name').textContent = '暂无可下载的 APK';
+  document.querySelector('#meta').textContent = '';
+  document.querySelector('#hash').hidden = true;
+  document.querySelector('#state').textContent = message;
+}
 async function refresh() {
   try {
     const response = await fetch(base + 'manifest.json', {cache: 'no-store'});
+    if (!response.ok) throw new Error(response.status === 404 ? '分享链接已失效，请向开发获取新地址。' : 'Mac 暂时无法提供 APK，请稍后重试。');
     const data = await response.json();
-    if (!data.available) throw new Error('Mac 暂未准备 APK');
+    if (!data.available) {
+      unavailable('已连接到 Mac，正在等待构建完成。此页面会自动更新。');
+      return;
+    }
     document.querySelector('#name').textContent = data.fileName;
     document.querySelector('#meta').textContent = data.sizeLabel + ' · ' + new Date(data.modifiedAt).toLocaleString();
     const hash = document.querySelector('#hash');
@@ -288,11 +326,12 @@ async function refresh() {
     document.querySelector('#state').textContent = lastSha && lastSha !== data.sha256 ? '检测到新构建，可以重新下载。' : '已连接到 Mac。';
     lastSha = data.sha256;
   } catch (error) {
-    document.querySelector('#state').textContent = error.message || '暂时无法连接 Mac。';
+    unavailable(error.message || '暂时无法连接 Mac，请确认工具已启动并连接同一 Wi-Fi。');
   }
 }
 refresh();
 setInterval(refresh, 2500);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
 </script>
 </body>
 </html>''';
@@ -306,9 +345,3 @@ class _ByteRange {
 }
 
 const _invalidRange = _ByteRange(-1, -1);
-
-String _newToken() {
-  final random = Random.secure();
-  final bytes = List<int>.generate(18, (_) => random.nextInt(256));
-  return base64UrlEncode(bytes).replaceAll('=', '');
-}

@@ -1,7 +1,7 @@
 name: lan_apk_sync
 description: "Share locally built APK files with Android phones over an isolated Wi-Fi network."
 publish_to: 'none'
-version: 1.0.0+1
+version: 1.1.0+2
 
 environment:
   sdk: ^3.6.2

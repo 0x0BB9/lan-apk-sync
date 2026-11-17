@@ -5,7 +5,7 @@ import FlutterMacOS
 
 class MainFlutterWindow: NSWindow {
   private var nativeChannel: FlutterMethodChannel?
-  private var securityScopedURLs: [URL] = []
+  private let preferences = SharingPreferences()
 
   override func awakeFromNib() {
     let flutterViewController = FlutterViewController()
@@ -19,12 +19,6 @@ class MainFlutterWindow: NSWindow {
     configureNativeChannel(flutterViewController)
 
     super.awakeFromNib()
-  }
-
-  deinit {
-    for url in securityScopedURLs {
-      url.stopAccessingSecurityScopedResource()
-    }
   }
 
   private func configureNativeChannel(_ controller: FlutterViewController) {
@@ -42,6 +36,10 @@ class MainFlutterWindow: NSWindow {
         self.pickApk(result: result)
       case "pickDirectory":
         self.pickDirectory(result: result)
+      case "loadSettings":
+        self.loadSettings(result: result)
+      case "saveSettings":
+        self.saveSettings(call: call, result: result)
       case "sha256":
         self.sha256(call: call, result: result)
       case "qrCode":
@@ -66,8 +64,7 @@ class MainFlutterWindow: NSWindow {
         result(nil)
         return
       }
-      self?.retainAccess(to: url)
-      result(url.path)
+      self?.rememberSource(url, kind: "file", result: result)
     }
   }
 
@@ -83,15 +80,44 @@ class MainFlutterWindow: NSWindow {
         result(nil)
         return
       }
-      self?.retainAccess(to: url)
-      result(url.path)
+      self?.rememberSource(url, kind: "directory", result: result)
     }
   }
 
-  private func retainAccess(to url: URL) {
-    if url.startAccessingSecurityScopedResource() {
-      securityScopedURLs.append(url)
+  private func rememberSource(_ url: URL, kind: String, result: @escaping FlutterResult) {
+    do {
+      try preferences.rememberSource(url, kind: kind)
+      result(url.path)
+    } catch {
+      result(FlutterError(
+        code: "bookmark_failed",
+        message: "无法保存文件访问权限，请重新选择 APK 或目录。",
+        details: nil
+      ))
     }
+  }
+
+  private func loadSettings(result: @escaping FlutterResult) {
+    result(preferences.load())
+  }
+
+  private func saveSettings(call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard let arguments = call.arguments as? [String: Any],
+          let token = arguments["token"] as? String,
+          token.range(of: "^[A-Za-z0-9_-]{24}$", options: .regularExpression) != nil,
+          let port = arguments["port"] as? Int,
+          (1024...65535).contains(port),
+          let autoStart = arguments["autoStart"] as? Bool else {
+      result(FlutterError(code: "bad_settings", message: "无法保存同步设置。", details: nil))
+      return
+    }
+    var settings: [String: Any] = ["token": token, "port": port, "autoStart": autoStart]
+    if let address = arguments["preferredAddress"] as? String {
+      settings["preferredAddress"] = address
+    }
+    // Preferences and security-scoped bookmarks stay in this Mac's app container.
+    preferences.save(settings)
+    result(nil)
   }
 
   private func sha256(call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -158,5 +184,69 @@ class MainFlutterWindow: NSWindow {
       return
     }
     result(FlutterStandardTypedData(bytes: png))
+  }
+}
+
+final class SharingPreferences {
+  private let defaults: UserDefaults
+  private let settingsKey = "lanApkSync.settings"
+  private let sourceKey = "lanApkSync.source"
+  private var securityScopedURLs: [URL] = []
+
+  init(defaults: UserDefaults = .standard) {
+    self.defaults = defaults
+  }
+
+  deinit {
+    for url in securityScopedURLs {
+      url.stopAccessingSecurityScopedResource()
+    }
+  }
+
+  func save(_ settings: [String: Any]) {
+    defaults.set(settings, forKey: settingsKey)
+  }
+
+  func rememberSource(_ url: URL, kind: String) throws {
+    retainAccess(to: url)
+    let bookmark = try url.bookmarkData(
+      options: [.withSecurityScope, .securityScopeAllowOnlyReadAccess],
+      includingResourceValuesForKeys: nil,
+      relativeTo: nil
+    )
+    defaults.set(["bookmark": bookmark, "kind": kind], forKey: sourceKey)
+  }
+
+  func load() -> [String: Any] {
+    var settings = defaults.dictionary(forKey: settingsKey) ?? [:]
+    if let source = defaults.dictionary(forKey: sourceKey),
+       let bookmark = source["bookmark"] as? Data,
+       let kind = source["kind"] as? String,
+       kind == "file" || kind == "directory" {
+      do {
+        var stale = false
+        let url = try URL(
+          resolvingBookmarkData: bookmark,
+          options: [.withSecurityScope, .withoutUI],
+          relativeTo: nil,
+          bookmarkDataIsStale: &stale
+        )
+        retainAccess(to: url)
+        if stale {
+          try rememberSource(url, kind: kind)
+        }
+        settings["sourcePath"] = url.path
+        settings["sourceKind"] = kind
+      } catch {
+        settings["sourceError"] = "无法恢复上次的文件访问权限，请重新选择 APK 或输出目录。"
+      }
+    }
+    return settings
+  }
+
+  private func retainAccess(to url: URL) {
+    if !securityScopedURLs.contains(url), url.startAccessingSecurityScopedResource() {
+      securityScopedURLs.append(url)
+    }
   }
 }
