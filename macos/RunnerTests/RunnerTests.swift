@@ -54,4 +54,62 @@ class RunnerTests: XCTestCase {
     XCTAssertNotNil(restored["sourceError"])
   }
 
+  func testMultipleSourcesAreAppendedDeduplicatedAndRestored() throws {
+    let directory = FileManager.default.temporaryDirectory
+      .appendingPathComponent("lan-apk-multi-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let a = directory.appendingPathComponent("a.apk")
+    let b = directory.appendingPathComponent("b.apk")
+    try Data([1]).write(to: a)
+    try Data([2]).write(to: b)
+    let store = SharingPreferences(defaults: defaults)
+    try store.rememberSource(a, kind: "file")
+    try store.rememberSources([a, b], kind: "file")
+    try store.rememberSource(directory, kind: "directory")
+    let sources = try XCTUnwrap(SharingPreferences(defaults: defaults).load()["sources"] as? [[String: String]])
+    XCTAssertEqual(sources.count, 3)
+    XCTAssertEqual(Set(sources.compactMap { $0["kind"] }), Set(["file", "directory"]))
+  }
+
+  func testLegacyBookmarkMigratesWithoutChangingTheLink() throws {
+    let store = SharingPreferences(defaults: defaults)
+    let directory = FileManager.default.temporaryDirectory
+    try store.rememberSource(directory, kind: "directory")
+    let records = try XCTUnwrap(defaults.array(forKey: "lanApkSync.sources") as? [[String: Any]])
+    defaults.set(records[0], forKey: "lanApkSync.source")
+    defaults.removeObject(forKey: "lanApkSync.sources")
+    store.save(["token": String(repeating: "c", count: 24)])
+    let restored = SharingPreferences(defaults: defaults).load()
+    XCTAssertEqual(restored["token"] as? String, String(repeating: "c", count: 24))
+    XCTAssertEqual((restored["sources"] as? [[String: String]])?.count, 1)
+    XCTAssertNil(defaults.object(forKey: "lanApkSync.source"))
+  }
+
+  func testRemovalPersistsExclusionButNeverDeletesTheApk() throws {
+    let file = FileManager.default.temporaryDirectory.appendingPathComponent("lan-remove-\(UUID().uuidString).apk")
+    try Data([1]).write(to: file)
+    defer { try? FileManager.default.removeItem(at: file) }
+    let store = SharingPreferences(defaults: defaults)
+    try store.rememberSource(file, kind: "file")
+    store.removeSource(path: file.path, excludeApk: true)
+    let restored = SharingPreferences(defaults: defaults).load()
+    XCTAssertEqual((restored["sources"] as? [[String: String]])?.count, 0)
+    XCTAssertTrue((restored["excludedPaths"] as? [String])?.contains(file.path) == true)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+    try store.rememberSource(file, kind: "file")
+    XCTAssertEqual((store.load()["excludedPaths"] as? [String])?.count, 0)
+  }
+
+  func testOneBrokenBookmarkDoesNotWithdrawOtherSources() throws {
+    let store = SharingPreferences(defaults: defaults)
+    try store.rememberSource(FileManager.default.temporaryDirectory, kind: "directory")
+    var records = try XCTUnwrap(defaults.array(forKey: "lanApkSync.sources") as? [[String: Any]])
+    records.append(["bookmark": Data([0, 1, 2]), "kind": "file"])
+    defaults.set(records, forKey: "lanApkSync.sources")
+    let restored = store.load()
+    XCTAssertEqual((restored["sources"] as? [[String: String]])?.count, 1)
+    XCTAssertNotNil(restored["sourceError"])
+  }
+
 }

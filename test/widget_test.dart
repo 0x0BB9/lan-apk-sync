@@ -43,7 +43,8 @@ void main() {
     await showHome(tester);
 
     expect(find.text('隔离网络内同步 APK'), findsOneWidget);
-    expect(find.text('选择 APK'), findsOneWidget);
+    expect(find.text('添加 APK（可多选）'), findsOneWidget);
+    expect(find.text('添加监听目录'), findsOneWidget);
     expect(find.text('开始同步'), findsOneWidget);
     expect(find.text('3. 手机固定入口'), findsOneWidget);
     expect(find.text('8888'), findsOneWidget);

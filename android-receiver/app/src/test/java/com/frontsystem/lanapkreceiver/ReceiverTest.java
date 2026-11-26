@@ -15,6 +15,8 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.List;
+import org.json.JSONObject;
 import static org.junit.Assert.*;
 
 public final class ReceiverTest {
@@ -174,6 +176,82 @@ public final class ReceiverTest {
         byte[] yuv = new byte[500 * 500 * 3 / 2];
         for (int y = 0; y < 500; y++) for (int x = 0; x < 500; x++) yuv[y * 500 + x] = (byte) (matrix.get(x, y) ? 0 : 255);
         assertEquals(BASE, QrDecoder.frame(yuv, 500, 500));
+    }
+
+    @Test public void parsesSameNamedApksWithIndependentStableIds() throws Exception {
+        String a = catalogItem(new byte[]{1}, "a".repeat(64));
+        String b = catalogItem(new byte[]{2}, "b".repeat(64));
+        List<ApkManifest> apks = ApkManifest.parseCatalog(catalogJson(a, b));
+        assertEquals(2, apks.size());
+        assertEquals(apks.get(0).fileName, apks.get(1).fileName);
+        assertNotEquals(apks.get(0).id, apks.get(1).id);
+        assertEquals(BASE + apks.get(1).downloadPath, ShareEndpoint.parse(BASE).download(apks.get(1)).toString());
+    }
+
+    @Test public void refusesDuplicateIdsAndExternalCatalogPaths() throws Exception {
+        String a = catalogItem(new byte[]{1}, "a".repeat(64));
+        assertThrows(IOException.class, () -> ApkManifest.parseCatalog(catalogJson(a, a)));
+        assertThrows(IOException.class, () -> ApkManifest.parseCatalog(catalogJson(a).replace("\"schemaVersion\":2", "\"schemaVersion\":3")));
+        String external = new JSONObject(a).put("downloadPath", "http://example.com/app.apk").toString();
+        assertThrows(IOException.class, () -> ApkManifest.parseCatalog(catalogJson(external)));
+        String wrongRevision = new JSONObject(a).put("downloadPath", "apks/" + "a".repeat(64)
+                + "/download?sha256=" + "b".repeat(64)).toString();
+        assertThrows(IOException.class, () -> ApkManifest.parseCatalog(catalogJson(wrongRevision)));
+    }
+
+    @Test public void fetchesCatalogAndDownloadsTheSelectedItemOnly() throws Exception {
+        byte[] a = {1};
+        byte[] b = {2, 3};
+        FakeConnection listing = new FakeConnection(200, catalogJson(catalogItem(a, "a".repeat(64)),
+                catalogItem(b, "b".repeat(64))).getBytes(StandardCharsets.UTF_8));
+        FakeConnection binary = new FakeConnection(200, b);
+        String[] downloadedPath = {null};
+        ShareClient client = new ShareClient(uri -> {
+            if (uri.toString().endsWith("catalog.json")) return listing;
+            downloadedPath[0] = uri.toString();
+            return binary;
+        });
+        List<ApkManifest> apks = client.catalog(ShareEndpoint.parse(BASE));
+        File file = client.download(ShareEndpoint.parse(BASE), apks.get(1), temporary.newFolder(),
+                new AtomicBoolean(), (received, total) -> {});
+        assertArrayEquals(b, Files.readAllBytes(file.toPath()));
+        assertEquals(BASE + apks.get(1).downloadPath, downloadedPath[0]);
+        assertTrue(listing.disconnected);
+    }
+
+    @Test public void fallsBackToLegacyMacOnlyOnCatalog404() throws Exception {
+        FakeConnection missing = new FakeConnection(404, new byte[0]);
+        FakeConnection legacy = new FakeConnection(200, json(new byte[]{1}).getBytes(StandardCharsets.UTF_8));
+        ShareClient client = new ShareClient(uri -> uri.toString().endsWith("catalog.json") ? missing : legacy);
+        List<ApkManifest> apks = client.catalog(ShareEndpoint.parse(BASE));
+        assertEquals(1, apks.size());
+        assertEquals("download", apks.get(0).downloadPath);
+        assertTrue(missing.disconnected);
+        FakeConnection denied = new FakeConnection(403, new byte[0]);
+        assertThrows(IOException.class, () -> new ShareClient(uri -> denied).catalog(ShareEndpoint.parse(BASE)));
+    }
+
+    @Test public void acceptsEmptyCatalogAndPreservesSelectedRevisionInState() throws Exception {
+        assertTrue(ApkManifest.parseCatalog(catalogJson()).isEmpty());
+        ApkManifest apk = ApkManifest.parse(catalogItem(new byte[]{1}, "a".repeat(64)));
+        ApkManifest restored = ApkManifest.parse(apk.toJson());
+        assertEquals(apk.id, restored.id);
+        assertEquals(apk.downloadPath, restored.downloadPath);
+    }
+
+    @Test public void rejectsOversizedCatalogResponse() throws Exception {
+        FakeConnection response = new FakeConnection(200, new byte[1024 * 1024 + 1]);
+        assertThrows(IOException.class, () -> new ShareClient(uri -> response).catalog(ShareEndpoint.parse(BASE)));
+        assertTrue(response.disconnected);
+    }
+
+    private static String catalogJson(String... apks) {
+        return "{\"schemaVersion\":2,\"apks\":[" + String.join(",", apks) + "]}";
+    }
+
+    private static String catalogItem(byte[] bytes, String id) throws Exception {
+        return new JSONObject(json(bytes)).put("id", id)
+                .put("downloadPath", "apks/" + id + "/download?sha256=" + hash(bytes)).toString();
     }
 
     private int[] pixels(BitMatrix matrix, boolean rotate, boolean invert) {

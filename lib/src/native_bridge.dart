@@ -9,6 +9,23 @@ class NativeBridge {
 
   Future<String?> pickApk() => _channel.invokeMethod<String>('pickApk');
 
+  Future<List<String>> pickApks() async =>
+      await _channel.invokeListMethod<String>('pickApks') ?? [];
+
+  Future<Map<Object?, Object?>> removeSource(String path,
+          {bool apk = false}) async =>
+      await _channel.invokeMapMethod<Object?, Object?>(
+          apk ? 'removeApk' : 'removeSource', {'path': path}) ??
+      {};
+
+  Future<String> pathId(String path) async {
+    final value = await _channel.invokeMethod<String>('pathId', {'path': path});
+    if (value == null || !RegExp(r'^[a-f0-9]{64}$').hasMatch(value)) {
+      throw StateError('无法生成 APK 标识。');
+    }
+    return value;
+  }
+
   Future<String?> pickDirectory() =>
       _channel.invokeMethod<String>('pickDirectory');
 

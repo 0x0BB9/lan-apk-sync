@@ -11,6 +11,8 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.ArrayList;
+import java.util.List;
 
 final class ShareClient {
     interface ConnectionFactory { HttpURLConnection open(URI uri) throws IOException; }
@@ -21,6 +23,10 @@ final class ShareClient {
     ShareClient(ConnectionFactory connections) { this.connections = connections; }
 
     private HttpURLConnection connect(URI uri) throws IOException {
+        return connect(uri, false);
+    }
+
+    private HttpURLConnection connect(URI uri, boolean allowNotFound) throws IOException {
         HttpURLConnection connection = connections.open(uri);
         connection.setInstanceFollowRedirects(false);
         connection.setConnectTimeout(8000);
@@ -29,6 +35,7 @@ final class ShareClient {
         connection.setRequestProperty("Accept-Encoding", "identity");
         try {
             int status = connection.getResponseCode();
+            if (status == 404 && allowNotFound) { connection.disconnect(); return null; }
             if (status == 404) throw new IOException("分享入口失效或 APK 尚未就绪，请检查 Mac，必要时重新扫码。");
             if (status == 409) throw new IOException("Mac 正在更新 APK，请稍后重试。");
             if (status != 200) throw new IOException("Mac 服务返回 HTTP " + status + "，请检查共享状态。");
@@ -41,15 +48,30 @@ final class ShareClient {
 
     ApkManifest manifest(ShareEndpoint endpoint) throws IOException {
         HttpURLConnection connection = connect(endpoint.manifest());
+        return ApkManifest.parse(readText(connection, 65536));
+    }
+
+    List<ApkManifest> catalog(ShareEndpoint endpoint) throws IOException {
+        HttpURLConnection connection = connect(endpoint.catalog(), true);
+        if (connection == null) {
+            ApkManifest legacy = manifest(endpoint);
+            List<ApkManifest> result = new ArrayList<>();
+            if (legacy != null) result.add(legacy);
+            return result;
+        }
+        return ApkManifest.parseCatalog(readText(connection, 1024 * 1024));
+    }
+
+    private String readText(HttpURLConnection connection, int limit) throws IOException {
         try (InputStream input = connection.getInputStream();
              ByteArrayOutputStream output = new ByteArrayOutputStream()) {
             byte[] buffer = new byte[4096];
             int count;
             while ((count = input.read(buffer)) != -1) {
-                if (output.size() + count > 65536) throw new IOException("APK 信息过大，已拒绝读取。");
+                if (output.size() + count > limit) throw new IOException("APK 信息过大，已拒绝读取。");
                 output.write(buffer, 0, count);
             }
-            return ApkManifest.parse(new String(output.toByteArray(), StandardCharsets.UTF_8));
+            return new String(output.toByteArray(), StandardCharsets.UTF_8);
         } finally {
             connection.disconnect();
         }
@@ -65,7 +87,7 @@ final class ShareClient {
         File partial = new File(directory, manifest.sha256 + ".part");
         File target = new File(directory, manifest.sha256 + ".apk");
         boolean complete = false;
-        HttpURLConnection connection = connect(endpoint.download());
+        HttpURLConnection connection = connect(endpoint.download(manifest));
         try {
             long advertised = -1;
             String lengthHeader = connection.getHeaderField("Content-Length");

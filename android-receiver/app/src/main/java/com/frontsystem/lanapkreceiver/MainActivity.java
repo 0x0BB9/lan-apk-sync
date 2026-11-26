@@ -26,10 +26,14 @@ import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.RadioButton;
+import android.widget.RadioGroup;
 import androidx.core.content.FileProvider;
 import java.io.File;
 import java.io.IOException;
 import java.util.Locale;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -46,6 +50,11 @@ public final class MainActivity extends Activity {
     private SharedPreferences preferences;
     private ShareEndpoint endpoint;
     private ApkManifest manifest;
+    private List<ApkManifest> manifests = new ArrayList<>();
+    private String selectedId;
+    private RadioGroup choices;
+    private String choicesSignature = "";
+    private boolean updatingChoices;
     private File verifiedApk;
     private boolean fetching;
     private boolean downloading;
@@ -72,6 +81,7 @@ public final class MainActivity extends Activity {
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         preferences = getSharedPreferences("lan_share", MODE_PRIVATE);
+        selectedId = preferences.getString("selected_id", "");
         String saved = preferences.getString("endpoint", "");
         if (!saved.isEmpty()) {
             try { endpoint = ShareEndpoint.parse(saved); }
@@ -84,6 +94,7 @@ public final class MainActivity extends Activity {
                     File file = new File(getFilesDir(), "apks/" + restored.sha256 + ".apk");
                     if (file.isFile() && file.length() == restored.size) {
                         manifest = restored;
+                        selectedId = restored.id;
                         verifiedApk = file;
                         waitingForInstallPermission = state.getBoolean("waiting_install");
                     }
@@ -130,14 +141,37 @@ public final class MainActivity extends Activity {
                 .setNegativeButton("取消", null).setPositiveButton("忘记", (dialog, which) -> {
                     endpoint = null;
                     manifest = null;
+                    manifests.clear();
+                    selectedId = "";
                     verifiedApk = null;
-                    preferences.edit().remove("endpoint").apply();
+                    preferences.edit().remove("endpoint").remove("selected_id").apply();
                     setStatus("连接已清除，请重新扫码。", false);
                     render();
                 }).show());
 
         LinearLayout apk = card(content);
         addText(apk, "02  获取最新测试包", 16, GREEN, true);
+        choices = new RadioGroup(this);
+        choices.setOrientation(RadioGroup.VERTICAL);
+        apk.addView(choices, new LinearLayout.LayoutParams(-1, -2));
+        choices.setOnCheckedChangeListener((group, checkedId) -> {
+            if (updatingChoices || downloading || fetching) return;
+            RadioButton item = group.findViewById(checkedId);
+            if (item == null) return;
+            for (ApkManifest candidate : manifests) {
+                if (candidate.id.equals(item.getTag())) {
+                    if (manifest == null || !manifest.id.equals(candidate.id)
+                            || !manifest.sha256.equals(candidate.sha256)) verifiedApk = null;
+                    manifest = candidate;
+                    selectedId = candidate.id;
+                    waitingForInstallPermission = false;
+                    preferences.edit().putString("selected_id", selectedId).apply();
+                    setStatus("已选择 " + candidate.fileName + "，点击下载并安装。", false);
+                    render();
+                    break;
+                }
+            }
+        });
         details = addText(apk, "", 15, 0xff182b22, false);
         details.setTextIsSelectable(true);
         details.setPadding(0, dp(14), 0, dp(12));
@@ -222,6 +256,7 @@ public final class MainActivity extends Activity {
 
     private void render() {
         boolean busy = fetching || downloading;
+        renderChoices(busy);
         connection.setText(endpoint == null ? "尚未连接 Mac" : "已保存  " + endpoint.displayAddress());
         details.setText(manifest == null ? (endpoint == null ? "连接后显示 APK 信息。" : "等待 Mac 发布 APK…")
                 : manifest.fileName + "\n" + formatSize(manifest.size)
@@ -237,6 +272,32 @@ public final class MainActivity extends Activity {
         cancel.setEnabled(downloading && !cancelled.get());
         progress.setVisibility(downloading ? View.VISIBLE : View.GONE);
         getWindow().getDecorView().setKeepScreenOn(downloading);
+    }
+
+    private void renderChoices(boolean busy) {
+        StringBuilder signature = new StringBuilder();
+        for (ApkManifest apk : manifests) signature.append(apk.id).append(apk.sha256).append(apk.fileName);
+        updatingChoices = true;
+        if (!choicesSignature.equals(signature.toString())) {
+            choicesSignature = signature.toString();
+            choices.removeAllViews();
+            for (ApkManifest apk : manifests) {
+                RadioButton option = new RadioButton(this);
+                option.setId(View.generateViewId());
+                option.setTag(apk.id);
+                option.setText(apk.fileName + "  ·  " + formatSize(apk.size) + "\nID " + apk.id.substring(0, 8));
+                option.setTextSize(14);
+                option.setTextColor(0xff182b22);
+                option.setPadding(0, dp(10), 0, dp(10));
+                choices.addView(option, new RadioGroup.LayoutParams(-1, -2));
+            }
+        }
+        for (int index = 0; index < choices.getChildCount(); index++) {
+            RadioButton option = (RadioButton) choices.getChildAt(index);
+            option.setEnabled(!busy);
+            if (option.getTag().equals(selectedId)) option.setChecked(true);
+        }
+        updatingChoices = false;
     }
 
     private void setStatus(String message, boolean error) {
@@ -301,8 +362,10 @@ public final class MainActivity extends Activity {
                 .setNegativeButton("取消", null).setPositiveButton("连接并保存", (dialog, which) -> {
                     endpoint = candidate;
                     manifest = null;
+                    manifests.clear();
+                    selectedId = "";
                     verifiedApk = null;
-                    preferences.edit().putString("endpoint", candidate.toString()).apply();
+                    preferences.edit().putString("endpoint", candidate.toString()).remove("selected_id").apply();
                     render();
                     fetch();
                 }).show();
@@ -315,15 +378,22 @@ public final class MainActivity extends Activity {
         render();
         worker.execute(() -> {
             try {
-                ApkManifest latest = client.manifest(requested);
+                List<ApkManifest> catalog = client.catalog(requested);
                 post(() -> {
                     fetching = false;
                     if (endpoint != requested) { render(); return; }
-                    if (latest == null || manifest == null || !manifest.sha256.equals(latest.sha256)) verifiedApk = null;
+                    ApkManifest latest = null;
+                    for (ApkManifest candidate : catalog) if (candidate.id.equals(selectedId)) latest = candidate;
+                    if (latest == null && !catalog.isEmpty()) latest = catalog.get(0);
+                    if (latest == null || manifest == null || !manifest.id.equals(latest.id)
+                            || !manifest.sha256.equals(latest.sha256)) verifiedApk = null;
+                    manifests = catalog;
                     manifest = latest;
+                    selectedId = latest == null ? "" : latest.id;
+                    preferences.edit().putString("selected_id", selectedId).apply();
                     if (!waitingForInstallPermission) setStatus(latest == null
                             ? "已连接 Mac，等待生成 APK。页面每 5 秒检查一次。"
-                            : "已获取最新包。下载完成后会校验并打开系统安装器。", false);
+                            : "可选 " + catalog.size() + " 个 APK，请选择后下载。", false);
                     render();
                 });
             } catch (IOException exception) {
@@ -331,6 +401,7 @@ public final class MainActivity extends Activity {
                     fetching = false;
                     if (endpoint == requested) {
                         manifest = null;
+                        manifests.clear();
                         verifiedApk = null;
                         setStatus(networkError(exception), true);
                     }

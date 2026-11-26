@@ -6,23 +6,29 @@ class SharedApk {
     required this.size,
     required this.modifiedAt,
     required this.sha256,
+    this.identifier,
   });
 
   final File file;
   final int size;
   final DateTime modifiedAt;
   final String sha256;
+  final String? identifier;
+
+  String get id => identifier ?? sha256;
 
   String get fileName => file.uri.pathSegments.last;
 
-  Map<String, Object> toManifest() => {
+  Map<String, Object> toManifest({bool catalog = false}) => {
+        'id': id,
         'available': true,
         'fileName': fileName,
         'size': size,
         'sizeLabel': formatBytes(size),
         'modifiedAt': modifiedAt.toUtc().toIso8601String(),
         'sha256': sha256,
-        'downloadPath': 'download',
+        'downloadPath':
+            catalog ? 'apks/$id/download?sha256=$sha256' : 'download',
       };
 }
 

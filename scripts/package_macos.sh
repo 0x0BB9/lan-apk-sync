@@ -26,6 +26,7 @@ mkdir -p "$project_dir/dist"
 stage_dir="$(mktemp -d "$project_dir/dist/LAN-APK-Sync-$version.XXXXXX")"
 ditto --norsrc --noextattr --noqtn "$app_path" "$stage_dir/LAN APK Sync.app"
 cp "$project_dir/docs/OFFLINE.md" "$stage_dir/使用说明.md"
+cp "$project_dir/docs/ANDROID.md" "$stage_dir/ANDROID.md"
 printf 'Version: %s\nArchitectures: %s\nMinimum macOS: 10.15\n' \
   "$version" "$architectures" > "$stage_dir/BUILD-INFO.txt"
 

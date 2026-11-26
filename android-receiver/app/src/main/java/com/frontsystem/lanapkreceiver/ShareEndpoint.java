@@ -49,7 +49,9 @@ final class ShareEndpoint {
     }
 
     URI manifest() { return base.resolve("manifest.json"); }
+    URI catalog() { return base.resolve("catalog.json"); }
     URI download() { return base.resolve("download"); }
+    URI download(ApkManifest apk) { return base.resolve(apk.downloadPath); }
     String displayAddress() { return base.getHost() + (base.getPort() < 0 ? "" : ":" + base.getPort()); }
 
     @Override public String toString() { return base.toString(); }

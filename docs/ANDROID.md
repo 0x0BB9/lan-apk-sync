@@ -2,19 +2,21 @@
 
 ## 安装与使用
 
-1. 将 `LAN-APK-Receiver-1.0.0.apk` 和同名 `.sha256` 文件复制到隔离环境。在 Mac 校验：
+1. 将 `LAN-APK-Receiver-1.1.0.apk` 和同名 `.sha256` 文件复制到隔离环境。在 Mac 校验：
 
    ```bash
-   shasum -a 256 -c LAN-APK-Receiver-1.0.0.apk.sha256
+   shasum -a 256 -c LAN-APK-Receiver-1.1.0.apk.sha256
    ```
 
 2. 按测试机允许的本地安装方式，首次安装“局域网接包”。客户端自身也需要先安装；不能用尚未安装的客户端完成首次安装。
-3. Mac 和手机连接同一可互通的 Wi-Fi，开启现有 `LAN APK Sync` 共享。Mac `1.1.0` 无需升级。
+3. Mac 和手机连接同一可互通的 Wi-Fi，使用 Mac `1.2.0` 添加多份 APK 并开启共享。两端都需更新才能使用完整列表；旧 Mac 仍可通过新版客户端下载单个 APK。
 4. 打开“局域网接包”→“扫描 Mac 二维码”→允许相机→确认开发机地址。入口保存在手机本地；也支持二维码图片识别或手动输入完整链接。
-5. 点击“下载并安装”。客户端下载并校验 SHA-256，再打开系统安装器；首次按提示允许“局域网接包”安装未知应用，返回后继续安装。
-6. 以后打开客户端即可检查最新包，不必重新扫码。应用保持前台时每 5 秒检查，需手动点击下载与确认安装。
+5. 从列表选择一项，点击“下载并安装”。客户端下载并校验 SHA-256，再打开系统安装器；首次按提示允许“局域网接包”安装未知应用，返回后继续安装。
+6. 以后打开客户端即可查看全部 APK，保存上次选择，不必重新扫码。保持前台时每 5 秒刷新；Mac 追加文件后列表自动出现新项，需手动下载与确认安装。
 
 Mac IP、端口和分享令牌不变时入口可复用；Mac 重置链接或更换地址后重新扫码。没有外网的 Wi-Fi 如被系统提示无互联网，请保持连接，不要切到其他网络。
+
+客户端 `1.0.0` 在新版 Mac 上只会下载列表第一项，不能选择其他项，请覆盖安装新版客户端。保持原签名时会保留入口和授权；本项目未包含签名密钥。
 
 ## 安装权限与小米设备
 
@@ -54,21 +56,23 @@ bash scripts/package_android.sh
 
 ## 验收
 
-1. 关闭外网，保持手机和 Mac 局域网互通；首次扫码连接应显示 APK 文件名、大小、SHA-256，全程不启动浏览器。
+1. 关闭外网，保持手机和 Mac 局域网互通；Mac 添加两份 APK，手机列表应同时显示两项，可各自选择下载，全程不启动浏览器。同名文件可通过 ID 区分。
 2. 下载并安装；安装授权从设置返回后无需重新下载。系统取消安装时，可再次点击“安装已校验的 APK”。
-3. 退出并重新打开客户端，应恢复保存的入口；生成下一版 APK 后，在客户端检查并下载新版。
+3. 退出并重新打开客户端，应恢复入口和选中项；更新 A 不影响 B，新增 C 应自动出现在原列表，移除项不能误下载为其他项。
 4. Mac 暂停共享、输出目录为空、重置链接时，应分别显示连接失败、等待构建、入口失效；不能安装未通过校验的文件。
 
-自动化包括 JVM 单元测试、Debug/Release lint、APK 签名验证，以及模拟器上的本地二维码解码、FileProvider 路径限制、真实 Mac 服务下载和安装器 Intent 检查。模拟器检查不替代实体小米设备的相机与系统权限验收。
+自动化包括 JVM 单元测试、Debug/Release lint、APK 签名验证，以及模拟器上的本地二维码解码、FileProvider 路径限制、两份真实 APK 各自下载、选中第二项的安装器 Intent 和重开恢复选择检查。模拟器检查不替代实体小米设备的相机与系统权限验收。
 
 可选开发者集成检查（仅测试设备；需本机 `adb` / Dart）：
 
 ```bash
 cd android-receiver
-./gradlew assembleDebug assembleDebugAndroidTest --offline --no-daemon
+./gradlew assembleDebug assembleRelease assembleDebugAndroidTest --offline --no-daemon
 cd ..
-APK=android-receiver/app/build/outputs/apk/debug/app-debug.apk
-dart run tool/receiver_fixture.dart "$APK" "$(shasum -a 256 "$APK" | awk '{print $1}')"
+APK_A=android-receiver/app/build/outputs/apk/debug/app-debug.apk
+APK_B=android-receiver/app/build/outputs/apk/release/app-release.apk
+dart run tool/receiver_fixture.dart "$APK_A" "$(shasum -a 256 "$APK_A" | awk '{print $1}')" \
+  "$APK_B" "$(shasum -a 256 "$APK_B" | awk '{print $1}')"
 ```
 
 另开终端，指定测试模拟器运行（以下序列号仅为示例）：
@@ -78,6 +82,7 @@ adb -s emulator-5554 install -r android-receiver/app/build/outputs/apk/debug/app
 adb -s emulator-5554 install -r android-receiver/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
 adb -s emulator-5554 shell appops set com.frontsystem.lanapkreceiver REQUEST_INSTALL_PACKAGES allow
 adb -s emulator-5554 shell am instrument -w \
+  -e requireMultiple true \
   -e endpoint http://10.0.2.2:18787/0123456789abcdefghijklmn/ \
   com.frontsystem.lanapkreceiver.test/com.frontsystem.lanapkreceiver.ReceiverInstrumentation
 ```

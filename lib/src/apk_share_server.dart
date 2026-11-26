@@ -20,10 +20,13 @@ class DownloadEvent {
 
 class ApkShareServer {
   ApkShareServer({
-    required SharedApk? Function() currentApk,
+    SharedApk? Function()? currentApk,
+    List<SharedApk> Function()? currentApks,
     void Function(DownloadEvent event)? onDownload,
     String? token,
-  })  : _currentApk = currentApk,
+  })  : assert(currentApk != null || currentApks != null),
+        _currentApks =
+            currentApks ?? (() => [if (currentApk!() case final apk?) apk]),
         _onDownload = onDownload,
         _token = token ?? newShareToken() {
     if (!isValidShareToken(_token)) {
@@ -31,7 +34,7 @@ class ApkShareServer {
     }
   }
 
-  final SharedApk? Function() _currentApk;
+  final List<SharedApk> Function() _currentApks;
   final void Function(DownloadEvent event)? _onDownload;
   String _token;
   HttpServer? _server;
@@ -99,7 +102,7 @@ class ApkShareServer {
           headOnly: request.method == 'HEAD',
         );
       } else if (path == '$base/manifest.json') {
-        final apk = _currentApk();
+        final apk = _currentApks().firstOrNull;
         final body = jsonEncode(apk?.toManifest() ?? {'available': false});
         await _writeText(
           response,
@@ -107,8 +110,27 @@ class ApkShareServer {
           'application/json; charset=utf-8',
           headOnly: request.method == 'HEAD',
         );
+      } else if (path == '$base/catalog.json') {
+        final apks = _currentApks();
+        await _writeText(
+            response,
+            jsonEncode({
+              'schemaVersion': 2,
+              'available': apks.isNotEmpty,
+              'apks': [for (final apk in apks) apk.toManifest(catalog: true)],
+            }),
+            'application/json; charset=utf-8',
+            headOnly: request.method == 'HEAD');
       } else if (path == '$base/download') {
         await _serveApk(request);
+      } else if (path.startsWith('$base/apks/')) {
+        final match = RegExp(r'^apks/([a-f0-9]{64})/download$')
+            .firstMatch(path.substring(base.length + 1));
+        if (match == null) {
+          response.statusCode = HttpStatus.notFound;
+        } else {
+          await _serveApk(request, id: match.group(1));
+        }
       } else {
         response.statusCode = HttpStatus.notFound;
         await _writeText(
@@ -131,8 +153,11 @@ class ApkShareServer {
     }
   }
 
-  Future<void> _serveApk(HttpRequest request) async {
-    final apk = _currentApk();
+  Future<void> _serveApk(HttpRequest request, {String? id}) async {
+    final apks = _currentApks();
+    final apk = id == null
+        ? apks.firstOrNull
+        : apks.where((apk) => apk.id == id).firstOrNull;
     if (apk == null || !await apk.file.exists()) {
       request.response.statusCode = HttpStatus.notFound;
       await _writeText(
@@ -141,6 +166,12 @@ class ApkShareServer {
         'text/plain; charset=utf-8',
         headOnly: request.method == 'HEAD',
       );
+      return;
+    }
+
+    final expectedSha = request.uri.queryParameters['sha256'];
+    if (expectedSha != null && expectedSha != apk.sha256) {
+      request.response.statusCode = HttpStatus.conflict;
       return;
     }
 
@@ -274,14 +305,8 @@ class ApkShareServer {
 <body>
 <main>
   <section class="hero"><h1>LAN APK Sync</h1><p>APK 直接来自同一 Wi‑Fi 内的 Mac，不经过外网。</p></section>
-  <section class="card">
-    <div class="label">当前可下载版本</div>
-    <div id="name" class="name">正在读取…</div>
-    <div id="meta" class="meta"></div>
-    <div id="hash" class="hash" hidden></div>
-    <a id="download" class="disabled">等待 APK</a>
-    <div id="state">页面会自动检测 Mac 上的新构建。</div>
-  </section>
+  <section class="card"><div class="name">选择测试包</div><div id="state">正在读取…</div></section>
+  <div id="apks"></div>
   <section class="card">
     <div class="name">把这个页面保存到手机</div>
     <p class="meta">首次打开后，用浏览器菜单“收藏”或“添加到桌面”。以后直接打开此入口下载最新 APK，无需重复扫码，也不限定浏览器。</p>
@@ -294,37 +319,37 @@ class ApkShareServer {
 </main>
 <script>
 const base = location.pathname.endsWith('/') ? location.pathname : location.pathname + '/';
-let lastSha = '';
+let lastCatalog = '';
 function unavailable(message) {
-  const button = document.querySelector('#download');
-  button.removeAttribute('href');
-  button.classList.add('disabled');
-  button.textContent = '等待 APK';
-  document.querySelector('#name').textContent = '暂无可下载的 APK';
-  document.querySelector('#meta').textContent = '';
-  document.querySelector('#hash').hidden = true;
+  document.querySelector('#apks').replaceChildren();
+  lastCatalog = '';
   document.querySelector('#state').textContent = message;
 }
 async function refresh() {
   try {
-    const response = await fetch(base + 'manifest.json', {cache: 'no-store'});
+    const response = await fetch(base + 'catalog.json', {cache: 'no-store'});
     if (!response.ok) throw new Error(response.status === 404 ? '分享链接已失效，请向开发获取新地址。' : 'Mac 暂时无法提供 APK，请稍后重试。');
     const data = await response.json();
-    if (!data.available) {
+    if (!data.apks || !data.apks.length) {
       unavailable('已连接到 Mac，正在等待构建完成。此页面会自动更新。');
       return;
     }
-    document.querySelector('#name').textContent = data.fileName;
-    document.querySelector('#meta').textContent = data.sizeLabel + ' · ' + new Date(data.modifiedAt).toLocaleString();
-    const hash = document.querySelector('#hash');
-    hash.hidden = false;
-    hash.textContent = 'SHA-256  ' + data.sha256;
-    const button = document.querySelector('#download');
-    button.href = base + data.downloadPath;
-    button.classList.remove('disabled');
-    button.textContent = '下载 APK';
-    document.querySelector('#state').textContent = lastSha && lastSha !== data.sha256 ? '检测到新构建，可以重新下载。' : '已连接到 Mac。';
-    lastSha = data.sha256;
+    const signature = JSON.stringify(data.apks);
+    if (signature !== lastCatalog) {
+      const container = document.querySelector('#apks');
+      container.replaceChildren();
+      data.apks.forEach(apk => {
+        const card = document.createElement('section'); card.className = 'card';
+        const name = document.createElement('div'); name.className = 'name'; name.textContent = apk.fileName;
+        const meta = document.createElement('div'); meta.className = 'meta';
+        meta.textContent = apk.sizeLabel + ' · ' + new Date(apk.modifiedAt).toLocaleString() + ' · ID ' + apk.id.slice(0,8);
+        const hash = document.createElement('div'); hash.className = 'hash'; hash.textContent = 'SHA-256  ' + apk.sha256;
+        const button = document.createElement('a'); button.href = base + apk.downloadPath; button.textContent = '下载此 APK';
+        card.append(name, meta, hash, button); container.append(card);
+      });
+      lastCatalog = signature;
+    }
+    document.querySelector('#state').textContent = '已连接 Mac · ' + data.apks.length + ' 个 APK，列表会自动更新。';
   } catch (error) {
     unavailable(error.message || '暂时无法连接 Mac，请确认工具已启动并连接同一 Wi-Fi。');
   }

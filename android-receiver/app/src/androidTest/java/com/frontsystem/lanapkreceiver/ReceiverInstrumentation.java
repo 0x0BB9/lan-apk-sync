@@ -8,11 +8,13 @@ import android.os.Bundle;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
+import android.widget.RadioButton;
 import androidx.core.content.FileProvider;
 import com.google.zxing.BarcodeFormat;
 import com.google.zxing.common.BitMatrix;
 import com.google.zxing.qrcode.QRCodeWriter;
 import java.io.File;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 
 /** On-device checks, optionally against the real Mac server with -e endpoint <URL>. */
@@ -49,19 +51,34 @@ public final class ReceiverInstrumentation extends Instrumentation {
             if (endpointArg != null) {
                 ShareEndpoint endpoint = ShareEndpoint.parse(endpointArg);
                 ShareClient client = new ShareClient(uri -> LanConnections.open(context, uri));
-                ApkManifest manifest = client.manifest(endpoint);
-                check(manifest != null, "Mac manifest is available");
-                File apk = client.download(endpoint, manifest, new File(context.getFilesDir(), "apks"),
-                        new java.util.concurrent.atomic.AtomicBoolean(), (received, total) -> {});
-                check(context.getPackageManager().getPackageArchiveInfo(apk.getAbsolutePath(), 0) != null,
-                        "Real APK parses after transfer and checksum");
+                List<ApkManifest> apks = client.catalog(endpoint);
+                check(!apks.isEmpty(), "Mac catalog is available");
+                for (ApkManifest manifest : apks) {
+                    File apk = client.download(endpoint, manifest, new File(context.getFilesDir(), "apks"),
+                            new java.util.concurrent.atomic.AtomicBoolean(), (received, total) -> {});
+                    check(context.getPackageManager().getPackageArchiveInfo(apk.getAbsolutePath(), 0) != null,
+                            "Each real APK parses after independent transfer and checksum");
+                }
                 passed++;
+                if (arguments.getString("requireMultiple") != null) {
+                    check(apks.size() >= 2, "Two APKs are simultaneously available");
+                    check(!apks.get(0).id.equals(apks.get(1).id), "APKs have independent identities");
+                    passed++;
+                }
+                ApkManifest selected = apks.get(apks.size() - 1);
 
                 context.getSharedPreferences("lan_share", Context.MODE_PRIVATE).edit()
                         .putString("endpoint", endpoint.toString()).commit();
                 Activity activity = startActivitySync(new Intent(context, MainActivity.class)
                         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
                 waitForIdleSync();
+                waitForDownloadButton(activity);
+                runOnMainSync(() -> {
+                    RadioButton option = activity.getWindow().getDecorView().findViewWithTag(selected.id);
+                    check(option != null, "Selected APK is listed on the phone");
+                    option.performClick();
+                    check(option.isChecked(), "User can select the second APK");
+                });
                 waitForDownloadButton(activity);
                 // Intercept the installer intent: verify that the client never opens a browser.
                 AtomicReference<Intent> installation = new AtomicReference<>();
@@ -81,6 +98,8 @@ public final class ReceiverInstrumentation extends Instrumentation {
                 Intent intent = installation.get();
                 check(intent != null, "Download button launches installer intent");
                 check("content".equals(intent.getData().getScheme()), "Installer uses content URI");
+                check(intent.getData().getLastPathSegment().equals(selected.sha256 + ".apk"),
+                        "Installer receives the selected APK, not the first item");
                 check((intent.getFlags() & Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0,
                         "Installer receives temporary read grant");
                 removeMonitor(monitor);
@@ -89,6 +108,10 @@ public final class ReceiverInstrumentation extends Instrumentation {
                 Activity reopened = startActivitySync(new Intent(context, MainActivity.class)
                         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
                 waitForDownloadButton(reopened);
+                runOnMainSync(() -> {
+                    RadioButton option = reopened.getWindow().getDecorView().findViewWithTag(selected.id);
+                    check(option != null && option.isChecked(), "Selected APK survives reopening");
+                });
                 passed++;
                 runOnMainSync(reopened::finish);
             }

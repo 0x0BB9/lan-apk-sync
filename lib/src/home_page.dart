@@ -4,7 +4,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
-import 'apk_monitor.dart';
+import 'apk_catalog.dart';
 import 'apk_share_server.dart';
 import 'native_bridge.dart';
 import 'share_settings.dart';
@@ -22,7 +22,8 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   final _native = NativeBridge();
   final _portController = TextEditingController(text: '8787');
-  late final _monitor = ApkMonitor(sha256: _native.sha256);
+  late final _monitor =
+      ApkCatalog(sha256: _native.sha256, identifier: _native.pathId);
 
   ApkShareServer? _server;
   ShareSettings? _settings;
@@ -40,9 +41,7 @@ class _HomePageState extends State<HomePage> {
   Uint8List? _qrCode;
   final List<DownloadEvent> _downloads = [];
 
-  SharedApk? get _apk => _monitor.apk;
-  String? get _watchedDirectory =>
-      _monitor.isDirectory ? _monitor.sourcePath : null;
+  List<SharedApk> get _apks => _monitor.apks;
   bool get _canInteract => !_initializing && !_busy && _settings != null;
   bool get _isRunning => _server?.isRunning ?? false;
   String? get _shareUrl {
@@ -81,10 +80,7 @@ class _HomePageState extends State<HomePage> {
       setState(() {
         _settings = settings;
         _portController.text = '${settings.port}';
-        final path = values['sourcePath'];
-        if (path is String) {
-          _monitor.select(path, directory: values['sourceKind'] == 'directory');
-        }
+        _monitor.restore(values);
         _error = values['sourceError'] as String?;
       });
       await _loadAddresses();
@@ -106,12 +102,50 @@ class _HomePageState extends State<HomePage> {
       _error = null;
     });
     try {
-      final path =
-          directory ? await _native.pickDirectory() : await _native.pickApk();
-      if (path == null || !mounted) return;
+      final picked = directory
+          ? await _native.pickDirectory() != null
+          : (await _native.pickApks()).isNotEmpty;
+      if (!picked || !mounted) return;
+      final values = await _native.loadSettings();
+      if (!mounted) return;
       setState(() {
-        _monitor.select(path, directory: directory);
+        _monitor.restore(values);
         _apkError = null;
+        _error = values['sourceError'] as String?;
+      });
+      await _refreshApk();
+    } on Object catch (error) {
+      if (mounted) setState(() => _error = _errorMessage(error));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _removeSource(String path, {bool apk = false}) async {
+    final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+              title: Text(apk ? '移除此 APK？' : '停止共享此来源？'),
+              content: Text(apk
+                  ? '只从共享列表移除，不删除原文件。可重新添加此 APK 恢复共享。'
+                  : '只移除共享配置，不删除目录或 APK。'),
+              actions: [
+                TextButton(
+                    onPressed: () => Navigator.pop(context, false),
+                    child: const Text('取消')),
+                FilledButton(
+                    onPressed: () => Navigator.pop(context, true),
+                    child: const Text('移除')),
+              ],
+            ));
+    if (confirmed != true || !mounted) return;
+    setState(() => _busy = true);
+    try {
+      final values = await _native.removeSource(path, apk: apk);
+      if (!mounted) return;
+      setState(() {
+        _monitor.restore(values);
+        _error = values['sourceError'] as String?;
       });
       await _refreshApk();
     } on Object catch (error) {
@@ -135,7 +169,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _refreshApk() async {
-    if (_refreshingApk || !_monitor.hasSource) return;
+    if (_refreshingApk) return;
     _refreshingApk = true;
     try {
       await _monitor.refresh();
@@ -220,7 +254,7 @@ class _HomePageState extends State<HomePage> {
       if (!mounted) return;
       setState(() => _settings = settings);
       final server = ApkShareServer(
-        currentApk: () => _apk,
+        currentApks: () => _apks,
         token: settings.token,
         onDownload: (event) {
           if (!mounted) return;
@@ -433,10 +467,9 @@ class _HomePageState extends State<HomePage> {
   }
 
   Widget _buildSourcePanel() {
-    final apk = _apk;
     return _Panel(
       title: '1. 选择构建产物',
-      subtitle: '首次选择输出目录，后续正常打包即可；目录会自动记住。',
+      subtitle: '多选或逐次追加 APK；也可监听多个目录，重启后自动恢复。',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -448,13 +481,13 @@ class _HomePageState extends State<HomePage> {
                 onPressed:
                     _canInteract ? () => _pickSource(directory: false) : null,
                 icon: const Icon(Icons.android),
-                label: const Text('选择 APK'),
+                label: const Text('添加 APK（可多选）'),
               ),
               OutlinedButton.icon(
                 onPressed:
                     _canInteract ? () => _pickSource(directory: true) : null,
                 icon: const Icon(Icons.folder_open),
-                label: const Text('监听输出目录'),
+                label: const Text('添加监听目录'),
               ),
             ],
           ),
@@ -466,53 +499,57 @@ class _HomePageState extends State<HomePage> {
               borderRadius: BorderRadius.circular(14),
               border: Border.all(color: const Color(0xFFE2E8F0)),
             ),
-            child: apk == null
+            child: _apks.isEmpty
                 ? Text(
                     _monitor.hasSource
                         ? '等待 APK 生成或写入完成…\n可先开始同步，手机页面会自动更新。'
-                        : '尚未选择 APK 或输出目录',
+                        : '尚未添加 APK 或输出目录',
                     style: const TextStyle(color: Color(0xFF64748B)),
                   )
                 : Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(apk.fileName,
-                          style: const TextStyle(
-                              fontSize: 16, fontWeight: FontWeight.w700)),
-                      const SizedBox(height: 6),
-                      Text(
-                          '${formatBytes(apk.size)} · ${_formatTime(apk.modifiedAt)}'),
-                      const SizedBox(height: 8),
-                      SelectableText(
-                        apk.file.path,
-                        style: const TextStyle(
-                            fontSize: 12, color: Color(0xFF475569)),
-                      ),
-                      const SizedBox(height: 8),
-                      SelectableText(
-                        'SHA-256  ${apk.sha256}',
-                        style: const TextStyle(
-                          fontFamily: 'monospace',
-                          fontSize: 11,
-                          color: Color(0xFF64748B),
-                        ),
-                      ),
+                      Text('可下载 APK：${_apks.length} 个',
+                          style: const TextStyle(fontWeight: FontWeight.w700)),
+                      for (final apk in _apks) ...[
+                        const Divider(height: 22),
+                        Row(children: [
+                          Expanded(
+                              child: Text(apk.fileName,
+                                  style: const TextStyle(
+                                      fontWeight: FontWeight.w700))),
+                          IconButton(
+                              tooltip: '移除此 APK',
+                              onPressed: _canInteract
+                                  ? () =>
+                                      _removeSource(apk.file.path, apk: true)
+                                  : null,
+                              icon: const Icon(Icons.remove_circle_outline)),
+                        ]),
+                        Text(
+                            '${formatBytes(apk.size)} · ${_formatTime(apk.modifiedAt)}'),
+                        SelectableText(apk.file.path,
+                            style: const TextStyle(
+                                fontSize: 11, color: Color(0xFF64748B))),
+                      ],
                     ],
                   ),
           ),
-          if (_watchedDirectory != null) ...[
-            const SizedBox(height: 10),
-            Text(
-              '正在监听：$_watchedDirectory',
-              style: const TextStyle(fontSize: 12, color: Color(0xFF64748B)),
+          for (final source in _monitor.sources)
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              dense: true,
+              leading:
+                  Icon(source.isDirectory ? Icons.folder_open : Icons.android),
+              title: Text(source.path, style: const TextStyle(fontSize: 12)),
+              subtitle: Text(
+                  source.isDirectory ? '监听目录内所有 APK（含子目录）' : '已记住文件；更新后自动发布'),
+              trailing: IconButton(
+                  tooltip: '移除共享来源',
+                  onPressed:
+                      _canInteract ? () => _removeSource(source.path) : null,
+                  icon: const Icon(Icons.close)),
             ),
-          ] else if (_monitor.sourcePath != null) ...[
-            const SizedBox(height: 10),
-            Text(
-              '已记住文件：${_monitor.sourcePath}',
-              style: const TextStyle(fontSize: 12, color: Color(0xFF64748B)),
-            ),
-          ],
           const SizedBox(height: 22),
           const Divider(),
           const SizedBox(height: 18),
@@ -551,7 +588,7 @@ class _HomePageState extends State<HomePage> {
           SwitchListTile.adaptive(
             contentPadding: EdgeInsets.zero,
             title: const Text('下次打开自动开始同步'),
-            subtitle: const Text('恢复上次的目录、端口和分享链接；无需重新选择。'),
+            subtitle: const Text('恢复全部文件、目录、端口和分享链接。'),
             value: _settings?.autoStart ?? true,
             onChanged: _canInteract ? _setAutoStart : null,
           ),
@@ -564,7 +601,7 @@ class _HomePageState extends State<HomePage> {
     final url = _shareUrl;
     return _Panel(
       title: '3. 手机固定入口',
-      subtitle: '首次打开后收藏或添加到桌面，以后直接打开下载最新 APK。',
+      subtitle: '客户端扫码一次，之后在同一入口选择 APK；也可使用浏览器收藏。',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [

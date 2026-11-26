@@ -34,6 +34,8 @@ class MainFlutterWindow: NSWindow {
       switch call.method {
       case "pickApk":
         self.pickApk(result: result)
+      case "pickApks":
+        self.pickApk(multiple: true, result: result)
       case "pickDirectory":
         self.pickDirectory(result: result)
       case "loadSettings":
@@ -44,6 +46,19 @@ class MainFlutterWindow: NSWindow {
         self.sha256(call: call, result: result)
       case "qrCode":
         self.qrCode(call: call, result: result)
+      case "pathId":
+        guard let args = call.arguments as? [String: Any], let path = args["path"] as? String else {
+          result(FlutterError(code: "bad_path", message: "Missing path.", details: nil))
+          return
+        }
+        result(SHA256.hash(data: Data(path.utf8)).map { String(format: "%02x", $0) }.joined())
+      case "removeSource", "removeApk":
+        guard let args = call.arguments as? [String: Any], let path = args["path"] as? String else {
+          result(FlutterError(code: "bad_path", message: "Missing path.", details: nil))
+          return
+        }
+        self.preferences.removeSource(path: path, excludeApk: call.method == "removeApk")
+        result(self.preferences.load())
       default:
         result(FlutterMethodNotImplemented)
       }
@@ -51,20 +66,25 @@ class MainFlutterWindow: NSWindow {
     nativeChannel = channel
   }
 
-  private func pickApk(result: @escaping FlutterResult) {
+  private func pickApk(multiple: Bool = false, result: @escaping FlutterResult) {
     let panel = NSOpenPanel()
     panel.title = "选择要同步的 APK"
-    panel.prompt = "选择 APK"
+    panel.prompt = "添加 APK"
     panel.allowedFileTypes = ["apk"]
-    panel.allowsMultipleSelection = false
+    panel.allowsMultipleSelection = multiple
     panel.canChooseDirectories = false
     panel.canChooseFiles = true
     panel.beginSheetModal(for: self) { [weak self] response in
-      guard response == .OK, let url = panel.url else {
+      guard response == .OK, !panel.urls.isEmpty else {
         result(nil)
         return
       }
-      self?.rememberSource(url, kind: "file", result: result)
+      do {
+        try self?.preferences.rememberSources(panel.urls, kind: "file")
+        result(multiple ? panel.urls.map { $0.path } : panel.urls.first!.path)
+      } catch {
+        result(FlutterError(code: "bookmark_failed", message: "无法保存 APK 访问权限，请重新添加。", details: nil))
+      }
     }
   }
 
@@ -191,6 +211,8 @@ final class SharingPreferences {
   private let defaults: UserDefaults
   private let settingsKey = "lanApkSync.settings"
   private let sourceKey = "lanApkSync.source"
+  private let sourcesKey = "lanApkSync.sources"
+  private let excludedKey = "lanApkSync.excludedPaths"
   private var securityScopedURLs: [URL] = []
 
   init(defaults: UserDefaults = .standard) {
@@ -208,39 +230,97 @@ final class SharingPreferences {
   }
 
   func rememberSource(_ url: URL, kind: String) throws {
-    retainAccess(to: url)
-    let bookmark = try url.bookmarkData(
-      options: [.withSecurityScope, .securityScopeAllowOnlyReadAccess],
-      includingResourceValuesForKeys: nil,
-      relativeTo: nil
-    )
-    defaults.set(["bookmark": bookmark, "kind": kind], forKey: sourceKey)
+    try rememberSources([url], kind: kind)
+  }
+
+  private func storedSources() -> [[String: Any]] {
+    if let sources = defaults.array(forKey: sourcesKey) as? [[String: Any]] { return sources }
+    if let legacy = defaults.dictionary(forKey: sourceKey) { return [legacy] }
+    return []
+  }
+
+  private func resolvedURL(_ source: [String: Any]) throws -> (URL, Bool) {
+    guard let bookmark = source["bookmark"] as? Data else {
+      throw NSError(domain: "LANApkSync", code: 1)
+    }
+    var stale = false
+    let url = try URL(resolvingBookmarkData: bookmark,
+                      options: [.withSecurityScope, .withoutUI], relativeTo: nil,
+                      bookmarkDataIsStale: &stale)
+    return (url, stale)
+  }
+
+  func rememberSources(_ urls: [URL], kind: String) throws {
+    // Prepare every bookmark first: cancelling/failing a multi-select is atomic.
+    let additions: [[String: Any]] = try urls.map { url in
+      let bookmark = try url.bookmarkData(
+        options: [.withSecurityScope, .securityScopeAllowOnlyReadAccess],
+        includingResourceValuesForKeys: nil, relativeTo: nil)
+      return ["bookmark": bookmark, "kind": kind, "path": url.path]
+    }
+    var sources = storedSources()
+    for (index, url) in urls.enumerated() {
+      sources.removeAll { source in
+        let path = source["path"] as? String ?? (try? resolvedURL(source).0.path)
+        return path == url.path
+      }
+      sources.append(additions[index])
+      retainAccess(to: url)
+    }
+    var excluded = defaults.stringArray(forKey: excludedKey) ?? []
+    excluded.removeAll { path in urls.contains { url in
+      path == url.path || (kind == "directory" && path.hasPrefix(url.path + "/"))
+    } }
+    defaults.set(excluded, forKey: excludedKey)
+    defaults.set(sources, forKey: sourcesKey)
+    defaults.removeObject(forKey: sourceKey)
+  }
+
+  func removeSource(path: String, excludeApk: Bool = false) {
+    let sources = storedSources().filter { source in
+      let storedPath = source["path"] as? String ?? (try? resolvedURL(source).0.path)
+      return storedPath != path
+    }
+    defaults.set(sources, forKey: sourcesKey)
+    defaults.removeObject(forKey: sourceKey)
+    if excludeApk {
+      var excluded = defaults.stringArray(forKey: excludedKey) ?? []
+      if !excluded.contains(path) { excluded.append(path) }
+      defaults.set(excluded, forKey: excludedKey)
+    }
+    // Keep already-open scopes until app exit, so active transfers can finish.
   }
 
   func load() -> [String: Any] {
     var settings = defaults.dictionary(forKey: settingsKey) ?? [:]
-    if let source = defaults.dictionary(forKey: sourceKey),
-       let bookmark = source["bookmark"] as? Data,
-       let kind = source["kind"] as? String,
-       kind == "file" || kind == "directory" {
+    var records = storedSources()
+    var restored: [[String: String]] = []
+    for index in records.indices {
+      let source = records[index]
       do {
-        var stale = false
-        let url = try URL(
-          resolvingBookmarkData: bookmark,
-          options: [.withSecurityScope, .withoutUI],
-          relativeTo: nil,
-          bookmarkDataIsStale: &stale
-        )
+        guard let kind = source["kind"] as? String, kind == "file" || kind == "directory" else {
+          throw NSError(domain: "LANApkSync", code: 2)
+        }
+        let (url, stale) = try resolvedURL(source)
         retainAccess(to: url)
         if stale {
-          try rememberSource(url, kind: kind)
+          records[index]["bookmark"] = try url.bookmarkData(
+            options: [.withSecurityScope, .securityScopeAllowOnlyReadAccess],
+            includingResourceValuesForKeys: nil, relativeTo: nil)
         }
-        settings["sourcePath"] = url.path
-        settings["sourceKind"] = kind
+        records[index]["path"] = url.path
+        restored.append(["path": url.path, "kind": kind])
       } catch {
-        settings["sourceError"] = "无法恢复上次的文件访问权限，请重新选择 APK 或输出目录。"
+        settings["sourceError"] = "部分文件访问权限无法恢复，请重新添加对应 APK 或目录。其他 APK 可继续共享。"
       }
     }
+    defaults.set(records, forKey: sourcesKey)
+    defaults.removeObject(forKey: sourceKey)
+    settings["sources"] = restored
+    settings["excludedPaths"] = defaults.stringArray(forKey: excludedKey) ?? []
+    // Retained for migration/test compatibility with single-source clients.
+    settings["sourcePath"] = restored.first?["path"]
+    settings["sourceKind"] = restored.first?["kind"]
     return settings
   }
 
