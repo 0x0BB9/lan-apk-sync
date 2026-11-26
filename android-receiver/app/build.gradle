@@ -1,0 +1,44 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.frontsystem.lanapkreceiver'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId 'com.frontsystem.lanapkreceiver'
+        minSdk 23
+        targetSdk 36
+        versionCode 1
+        versionName '1.0.0'
+        testInstrumentationRunner 'com.frontsystem.lanapkreceiver.ReceiverInstrumentation'
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    buildTypes {
+        // Internal test distribution only. No private production signing key is bundled.
+        release {
+            signingConfig signingConfigs.debug
+            minifyEnabled false
+        }
+    }
+    lint {
+        warningsAsErrors true
+        // Toolchain versions are intentionally pinned for reproducible offline builds.
+        disable 'OldTargetApi', 'GradleDependency', 'NewerVersionAvailable', 'AndroidGradlePluginVersion'
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core:1.15.0'
+    implementation 'com.google.zxing:core:3.5.3'
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20180813'
+}
+
+dependencyLocking {
+    lockAllConfigurations()
+}

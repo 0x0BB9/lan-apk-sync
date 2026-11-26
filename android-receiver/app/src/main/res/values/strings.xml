@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">局域网接包</string>
+    <string name="camera_reason">只在扫码时使用相机，画面不会上传或保存。也可以手动输入 Mac 分享链接。</string>
+</resources>

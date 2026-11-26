@@ -55,3 +55,9 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Standalone Android receiver
+**/.gradle/
+**/build/
+**/local.properties
+**/captures/
